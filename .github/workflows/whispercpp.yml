@@ -1,0 +1,174 @@
+name: whisper.cpp (Vulkan, Windows x64)
+
+# Builds whisper.cpp's whisper-server with the Vulkan backend and saves it as a
+# draft release, for RavensKeep's Settings > AI > Install whisper.cpp button.
+# Test the zip from the draft, publish the draft, then pin its version and
+# SHA-256 in the app. The app refuses any download that doesn't match the pin, so
+# a published release is never changed: rebuild under a higher build number.
+#
+# Pull requests that change the build only build it, and keep the zip as a run
+# artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_cpp:
+        description: whisper.cpp tag to build
+        default: v1.9.5
+        required: true
+      build:
+        description: Build number. Raise it to rebuild a version that already has a published release.
+        default: "1"
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/whispercpp.yml
+      - tools/build_whispercpp_vulkan.ps1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whispercpp-${{ github.event_name }}-${{ inputs.whisper_cpp || github.ref }}
+  cancel-in-progress: false
+
+env:
+  VULKAN_SDK_VERSION: 1.4.363.0
+  WHISPER_CPP: ${{ inputs.whisper_cpp || 'v1.9.5' }}
+  BUILD_NUMBER: ${{ inputs.build || '1' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.names.outputs.version }}
+      release: ${{ steps.names.outputs.release }}
+      zip: ${{ steps.names.outputs.zip }}
+      commit: ${{ steps.build.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Name the release
+        id: names
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:WHISPER_CPP -notmatch '^v\d+\.\d+\.\d+$') { throw "whisper_cpp must be an upstream tag like v1.9.5, not '$env:WHISPER_CPP'." }
+          if ($env:BUILD_NUMBER -notmatch '^[1-9]\d*$') { throw "build must be a whole number from 1, not '$env:BUILD_NUMBER'." }
+          # Build 1 keeps the plain upstream tag, so the names match the releases the app already knows.
+          $version = if ($env:BUILD_NUMBER -eq '1') { $env:WHISPER_CPP } else { "$env:WHISPER_CPP-b$env:BUILD_NUMBER" }
+          $release = "whispercpp-$version"
+          $zip = "whispercpp-vulkan-$version-win-x64.zip"
+          if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
+            $published = gh release view $release -R $env:GITHUB_REPOSITORY --json isDraft --jq '.isDraft == false' 2>$null
+            if ($published -eq 'true') { throw "$release is already published. Run again with a higher build number." }
+            # gh exits 1 when there's no release yet, and Actions would fail the step on that leftover code.
+            $global:LASTEXITCODE = 0
+          }
+          "version=$version", "release=$release", "zip=$zip" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Install the Vulkan SDK
+        shell: pwsh
+        run: |
+          $v = $env:VULKAN_SDK_VERSION
+          $exe = Join-Path $env:RUNNER_TEMP "vulkansdk.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$v/windows/vulkansdk-windows-X64-$v.exe" -OutFile $exe
+          $root = "C:\VulkanSDK\$v"
+          $p = Start-Process $exe -ArgumentList "--root", $root, "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait -PassThru
+          if ($p.ExitCode) { throw "Vulkan SDK installer failed: $($p.ExitCode)" }
+          "VULKAN_SDK=$root" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "$root\Bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build
+        id: build
+        shell: pwsh
+        env:
+          ZIP: out\${{ steps.names.outputs.zip }}
+        run: |
+          tools\build_whispercpp_vulkan.ps1 -Tag $env:WHISPER_CPP -Work "C:\w" -Dest "out\whispercpp" -Zip $env:ZIP
+          $commit = git -C "C:\w\w" rev-parse HEAD
+          if ($LASTEXITCODE) { throw "Couldn't read the whisper.cpp commit." }
+          "commit=$commit" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Attest build provenance
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/${{ steps.names.outputs.zip }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.names.outputs.release }}
+          path: |
+            out/${{ steps.names.outputs.zip }}
+            out/${{ steps.names.outputs.zip }}.sha256
+          if-no-files-found: error
+
+  draft-release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.release }}
+
+      - name: Save as a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+          RELEASE: ${{ needs.build.outputs.release }}
+          ZIP: ${{ needs.build.outputs.zip }}
+          COMMIT: ${{ needs.build.outputs.commit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          sha256sum -c "$ZIP.sha256"
+          hash=$(cut -d' ' -f1 "$ZIP.sha256")
+          notes=$(cat <<EOF
+          whisper.cpp $WHISPER_CPP \`whisper-server\` with the Vulkan backend (AMD, Intel and NVIDIA GPUs, or the processor), Windows x64. RavensKeep downloads it from Settings > AI > Install whisper.cpp.
+
+          Built from [ggml-org/whisper.cpp@$WHISPER_CPP]($GITHUB_SERVER_URL/ggml-org/whisper.cpp/tree/$COMMIT) (commit \`$COMMIT\`) by [this workflow run]($RUN_URL).
+
+          | File | SHA-256 |
+          | --- | --- |
+          | \`$ZIP\` | \`$hash\` |
+
+          Check that a download came from this repository's workflow:
+
+          \`\`\`
+          gh attestation verify $ZIP -R $GH_REPO
+          \`\`\`
+
+          whisper.cpp is MIT licensed; its license is in the zip as \`LICENSE-whisper.cpp.txt\`.
+          EOF
+          )
+          title="whisper.cpp $VERSION (Vulkan, Windows x64)"
+          # A draft exists only for people with write access, so the token sees it; a
+          # published release was already refused by the build job.
+          if [ "$(gh release view "$RELEASE" --json isDraft --jq .isDraft 2>/dev/null || true)" = "true" ]; then
+            gh release upload "$RELEASE" "$ZIP" "$ZIP.sha256" --clobber
+            gh release edit "$RELEASE" --title "$title" --notes "$notes"
+          else
+            gh release create "$RELEASE" "$ZIP" "$ZIP.sha256" --draft --latest=false \
+              --target "$GITHUB_SHA" --title "$title" --notes "$notes"
+          fi
+          url=$(gh release view "$RELEASE" --json url --jq .url)
+          {
+            echo "### Draft release: $RELEASE"
+            echo
+            echo "Test it, publish it at $url, then pin it in the app:"
+            echo
+            echo '```dart'
+            echo "const buildVersion = '$VERSION';"
+            echo "const buildSha256 = '$hash';"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
